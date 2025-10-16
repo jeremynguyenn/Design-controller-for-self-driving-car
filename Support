@@ -1,0 +1,243 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+class SupportFilesCar:
+    ''' The following functions interact with the main file.
+    Các hàm hỗ trợ cho mô hình xe tự hành, bao gồm tạo quỹ đạo, ma trận trạng thái, MPC, và các bổ sung như Kalman Filter và điều khiển dọc.'''
+
+    def __init__(self):
+        m = 1500  # Khối lượng xe (kg)
+        Iz = 3000  # Quán tính quay (kgm^2)
+        Caf = 15000  # Độ cứng lốp trước (N/rad) - Giảm từ 19000
+        Car = 25000  # Độ cứng lốp sau (N/rad) - Giảm từ 33000
+        lf = 2  # Khoảng cách từ trọng tâm đến trục trước (m)
+        lr = 3  # Khoảng cách từ trọng tâm đến trục sau (m)
+        Ts = 0.02  # Thời gian lấy mẫu (s)
+
+        Q = np.matrix('10 0; 0 10')  # Tăng trọng số cho trạng thái
+        S = np.matrix('1 0; 0 1')  # Ma trận trọng số cuối chân trời
+        R = np.matrix('0.1')  # Giảm trọng số cho đầu vào
+
+        outputs = 2  # Số đầu ra (psi, Y)
+        hz = 40  # Tăng chân trời dự đoán lên 40
+        x_dot = 20  # Tốc độ dọc tham chiếu (m/s)
+        lane_width = 7  # Chiều rộng làn đường (m)
+        nr_lanes = 5  # Số làn đường
+        r = 4  # Biên độ nhiễu đường (m)
+        f = 0.01  # Tần số nhiễu đường (1/m)
+        time_length = 10  # Thời gian mô phỏng (s)
+
+        PID_switch = 1  # Chuyển đổi giữa PID và MPC (0: MPC, 1: PID)
+        Kp_yaw = 2.0  # Giảm từ 10
+        Kd_yaw = 1.0  # Giảm từ 3
+        Ki_yaw = 0.5  # Giảm từ 5
+        Kp_Y = 2.0    # Giảm từ 10
+        Kd_Y = 1.0    # Giảm từ 3
+        Ki_Y = 0.5    # Giảm từ 5
+
+        Kp_v = 0.5
+        Kd_v = 0.2
+        Ki_v = 0.1
+
+        trajectory = 3  # Loại quỹ đạo
+
+        P = np.eye(5) * 0.1
+        Q_kf = np.eye(5) * 0.01  # Nhiễu quá trình
+        R_kf = np.eye(5) * 0.2   # Nhiễu đo lường - Tăng từ 0.1
+
+        self.constants = {'m': m, 'Iz': Iz, 'Caf': Caf, 'Car': Car, 'lf': lf, 'lr': lr,
+                          'Ts': Ts, 'Q': Q, 'S': S, 'R': R, 'outputs': outputs, 'hz': hz, 'x_dot': x_dot,
+                          'r': r, 'f': f, 'time_length': time_length, 'lane_width': lane_width,
+                          'PID_switch': PID_switch, 'Kp_yaw': Kp_yaw, 'Kd_yaw': Kd_yaw, 'Ki_yaw': Ki_yaw,
+                          'Kp_Y': Kp_Y, 'Kd_Y': Kd_Y, 'Ki_Y': Ki_Y, 'trajectory': trajectory,
+                          'Kp_v': Kp_v, 'Kd_v': Kd_v, 'Ki_v': Ki_v,
+                          'P': P, 'Q_kf': Q_kf, 'R_kf': R_kf}
+
+    def trajectory_generator(self, t, r, f):
+        Ts = self.constants['Ts']
+        x_dot = self.constants['x_dot']
+        trajectory = self.constants['trajectory']
+        x = np.linspace(0, x_dot * t[-1], num=len(t))
+
+        if trajectory == 1:
+            y = -9 * np.ones(len(t))
+        elif trajectory == 2:
+            y = 9 * np.tanh(t - t[-1] / 2)
+        elif trajectory == 3:
+            aaa = -28 / 100 ** 2
+            aaa = aaa / 1.1
+            if aaa < 0:
+                bbb = 14
+            else:
+                bbb = -14
+            y_1 = aaa * (x + self.constants['lane_width'] - 100) ** 2 + bbb
+            y_2 = 2 * r * np.sin(2 * np.pi * f * x)
+            y = (y_1 + y_2) / 2
+        elif trajectory == 4:
+            radius = 20
+            y = radius * np.sin(2 * np.pi * f * x)
+            x = radius * (1 - np.cos(2 * np.pi * f * x))
+        else:
+            print("For trajectories, only choose 1, 2, 3, or 4 as an integer value")
+            exit()
+
+        dx = x[1:] - x[:-1]
+        dy = y[1:] - y[:-1]
+        psi = np.zeros(len(x))
+        psiInt = psi
+        psi[0] = np.arctan2(dy[0], dx[0])
+        psi[1:] = np.arctan2(dy, dx)
+        dpsi = psi[1:] - psi[:-1]
+        psiInt[0] = psi[0]
+        for i in range(1, len(psiInt)):
+            if dpsi[i - 1] < -np.pi:
+                psiInt[i] = psiInt[i - 1] + (dpsi[i - 1] + 2 * np.pi)
+            elif dpsi[i - 1] > np.pi:
+                psiInt[i] = psiInt[i - 1] + (dpsi[i - 1] - 2 * np.pi)
+            else:
+                psiInt[i] = psiInt[i - 1] + dpsi[i - 1]
+        return psiInt, x, y
+
+    def state_space(self):
+        m = self.constants['m']
+        Iz = self.constants['Iz']
+        Caf = self.constants['Caf']
+        Car = self.constants['Car']
+        lf = self.constants['lf']
+        lr = self.constants['lr']
+        Ts = self.constants['Ts']
+        x_dot = self.constants['x_dot']
+
+        A1 = -(2 * Caf + 2 * Car) / (m * x_dot)
+        A2 = -x_dot - (2 * Caf * lf - 2 * Car * lr) / (m * x_dot)
+        A3 = -(2 * lf * Caf - 2 * lr * Car) / (Iz * x_dot)
+        A4 = -(2 * lf ** 2 * Caf + 2 * lr ** 2 * Car) / (Iz * x_dot)
+
+        A = np.array([[A1, 0, A2, 0], [0, 0, 1, 0], [A3, 0, A4, 0], [1, x_dot, 0, 0]])
+        B = np.array([[2 * Caf / m], [0], [2 * lf * Caf / Iz], [0]])
+        C = np.array([[0, 1, 0, 0], [0, 0, 0, 1]])
+        D = 0
+
+        Ad = np.identity(np.size(A, 1)) + Ts * A
+        Bd = Ts * B
+        Cd = C
+        Dd = D
+        return Ad, Bd, Cd, Dd
+
+    def mpc_simplification(self, Ad, Bd, Cd, Dd, hz, Q=None, S=None, R=None):
+        if Q is None:
+            Q = self.constants['Q']
+        if S is None:
+            S = self.constants['S']
+        if R is None:
+            R = self.constants['R']
+        A_aug = np.concatenate((Ad, Bd), axis=1)
+        temp1 = np.zeros((np.size(Bd, 1), np.size(Ad, 1)))
+        temp2 = np.identity(np.size(Bd, 1))
+        temp = np.concatenate((temp1, temp2), axis=1)
+        A_aug = np.concatenate((A_aug, temp), axis=0)
+        B_aug = np.concatenate((Bd, np.identity(np.size(Bd, 1))), axis=0)
+        C_aug = np.concatenate((Cd, np.zeros((np.size(Cd, 0), np.size(Bd, 1)))), axis=1)
+        D_aug = Dd
+
+        CQC = np.matmul(np.transpose(C_aug), Q)
+        CQC = np.matmul(CQC, C_aug)
+        CSC = np.matmul(np.transpose(C_aug), S)
+        CSC = np.matmul(CSC, C_aug)
+        QC = np.matmul(Q, C_aug)
+        SC = np.matmul(S, C_aug)
+
+        Qdb = np.zeros((np.size(CQC, 0) * hz, np.size(CQC, 1) * hz))
+        Tdb = np.zeros((np.size(QC, 0) * hz, np.size(QC, 1) * hz))
+        Rdb = np.zeros((np.size(R, 0) * hz, np.size(R, 1) * hz))
+        Cdb = np.zeros((np.size(B_aug, 0) * hz, np.size(B_aug, 1) * hz))
+        Adc = np.zeros((np.size(A_aug, 0) * hz, np.size(A_aug, 1)))
+
+        for i in range(hz):
+            if i == hz - 1:
+                Qdb[np.size(CSC, 0) * i:np.size(CSC, 0) * (i + 1),
+                    np.size(CSC, 1) * i:np.size(CSC, 1) * (i + 1)] = CSC
+                Tdb[np.size(SC, 0) * i:np.size(SC, 0) * (i + 1),
+                    np.size(SC, 1) * i:np.size(SC, 1) * (i + 1)] = SC
+            else:
+                Qdb[np.size(CQC, 0) * i:np.size(CQC, 0) * (i + 1),
+                    np.size(CQC, 1) * i:np.size(CQC, 1) * (i + 1)] = CQC
+                Tdb[np.size(QC, 0) * i:np.size(QC, 0) * (i + 1),
+                    np.size(QC, 1) * i:np.size(QC, 1) * (i + 1)] = QC
+
+            Rdb[np.size(R, 0) * i:np.size(R, 0) * (i + 1),
+                np.size(R, 1) * i:np.size(R, 1) * (i + 1)] = R
+
+            for j in range(hz):
+                if j <= i:
+                    Cdb[np.size(B_aug, 0) * i:np.size(B_aug, 0) * (i + 1),
+                        np.size(B_aug, 1) * j:np.size(B_aug, 1) * (j + 1)] = \
+                        np.matmul(np.linalg.matrix_power(A_aug, ((i + 1) - (j + 1))), B_aug)
+            Adc[np.size(A_aug, 0) * i:np.size(A_aug, 0) * (i + 1), :] = np.linalg.matrix_power(A_aug, i + 1)
+
+        Hdb = np.matmul(np.transpose(Cdb), Qdb)
+        Hdb = np.matmul(Hdb, Cdb) + Rdb
+        temp = np.matmul(np.transpose(Adc), Qdb)
+        temp = np.matmul(temp, Cdb)
+        temp2 = np.matmul(-Tdb, Cdb)
+        Fdbt = np.concatenate((temp, temp2), axis=0)
+        return Hdb, Fdbt, Cdb, Adc
+
+    def open_loop_new_states(self, states, U1):
+        m = self.constants['m']
+        Iz = self.constants['Iz']
+        Caf = self.constants['Caf']
+        Car = self.constants['Car']
+        lf = self.constants['lf']
+        lr = self.constants['lr']
+        Ts = self.constants['Ts']
+        x_dot = states[4]
+
+        y_dot, psi, psi_dot, Y, x_dot = states
+        sub_loop = 30
+        for i in range(sub_loop):
+            y_dot_dot = -(2 * Caf + 2 * Car) / (m * x_dot) * y_dot + (-x_dot - (2 * Caf * lf - 2 * Car * lr) / (m * x_dot)) * psi_dot + 2 * Caf / m * U1
+            psi_dot_dot = -(2 * lf * Caf - 2 * lr * Car) / (Iz * x_dot) * y_dot - (2 * lf ** 2 * Caf + 2 * lr ** 2 * Car) / (Iz * x_dot) * psi_dot + 2 * lf * Caf / Iz * U1
+            Y_dot = np.sin(psi) * x_dot + np.cos(psi) * y_dot
+            y_dot += y_dot_dot * Ts / sub_loop
+            psi += psi_dot * Ts / sub_loop
+            psi_dot += psi_dot_dot * Ts / sub_loop
+            Y += Y_dot * Ts / sub_loop
+
+        noise = np.random.normal(0, 0.01, size=4)
+        return np.array([y_dot + noise[0], psi + noise[1], psi_dot + noise[2], Y + noise[3], x_dot])
+
+    def kalman_filter(self, measured_states, U1, prev_states):
+        Ad, Bd, _, _ = self.state_space()
+        Ad_full = np.block([[Ad, np.zeros((4, 1))], [np.zeros((1, 4)), 1]])
+        Bd_full = np.concatenate((Bd, np.zeros((1, 1))), axis=0)
+        C_full = np.block([[np.eye(4), np.zeros((4, 1))], [np.zeros((1, 4)), 1]])
+
+        x_pred = np.matmul(Ad_full, prev_states) + np.matmul(Bd_full, [U1])
+        P_pred = np.matmul(np.matmul(Ad_full, self.constants['P']), np.transpose(Ad_full)) + self.constants['Q_kf']
+
+        K = np.matmul(np.matmul(P_pred, np.transpose(C_full)), np.linalg.inv(np.matmul(np.matmul(C_full, P_pred), np.transpose(C_full)) + self.constants['R_kf']))
+        x_est = x_pred + np.matmul(K, (measured_states - np.matmul(C_full, x_pred)))
+        self.constants['P'] = np.matmul((np.eye(5) - np.matmul(K, C_full)), P_pred)
+
+        return x_est
+
+    def longitudinal_control(self, v_ref, v_current):
+        Kp_v = self.constants['Kp_v']
+        Kd_v = self.constants['Kd_v']
+        Ki_v = self.constants['Ki_v']
+        Ts = self.constants['Ts']  # Sử dụng Ts từ constants
+
+        error = v_ref - v_current
+        if hasattr(self, 'e_int_pid_v'):
+            self.e_int_pid_v += error * Ts
+        else:
+            self.e_int_pid_v = 0
+        if hasattr(self, 'e_prev_pid_v'):
+            e_dot_pid_v = (error - self.e_prev_pid_v) / Ts
+        else:
+            e_dot_pid_v = 0
+        self.e_prev_pid_v = error
+
+        acceleration = Kp_v * error + Kd_v * e_dot_pid_v + Ki_v * self.e_int_pid_v
+        return max(min(acceleration, 1.0), -1.0)  # Giảm giới hạn từ ±2.0 xuống ±1.0
